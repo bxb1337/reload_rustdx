@@ -116,6 +116,41 @@ fn collect_filtered_day_files_returns_custom_error_when_none_found() {
     ));
 }
 
+#[test]
+fn collect_filtered_day_files_keeps_only_target_stock_codes() {
+    let mut input = std::env::temp_dir();
+    input.push(unique_name("filter_dir"));
+    fs::create_dir_all(&input).expect("create temp input directory");
+
+    let mut keep = input.clone();
+    keep.push("sz000001.day");
+    let mut drop = input.clone();
+    drop.push("bj430047.day");
+
+    fs::write(&keep, vec![0_u8; 32]).expect("write target stock file");
+    fs::write(&drop, vec![0_u8; 32]).expect("write non-target stock file");
+
+    let args = Args {
+        input: input.clone(),
+        output: None,
+        gbbq: None,
+        onlystocks: true,
+        stocks_per_batch: 30,
+    };
+
+    let result = collect_filtered_day_files(&args).expect("collect filtered files");
+
+    let _ = fs::remove_file(&keep);
+    let _ = fs::remove_file(&drop);
+    let _ = fs::remove_dir_all(&input);
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].file_stem().and_then(|name| name.to_str()),
+        Some("sz000001")
+    );
+}
+
 fn sample_columns(
     code: &str,
     date: &str,

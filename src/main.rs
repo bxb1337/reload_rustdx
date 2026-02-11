@@ -8,7 +8,7 @@ use cli::Args;
 use core::tdx_day::{
     OhlcvColumns, collect_day_files, is_target_stock_code, parse_day_file_into_columns,
 };
-use error::{AppResult, InputError, OutputError, ParseError, RuntimeError};
+use error::{AppError, AppResult, InputError, OutputError, ParseError, RuntimeError};
 use polars::prelude::{CsvWriter, DataFrame, NamedFrom, SerWriter, Series};
 use std::collections::VecDeque;
 use std::fs::File;
@@ -106,7 +106,18 @@ fn validate_gbbq_path(args: &Args) -> AppResult<()> {
 }
 
 fn collect_filtered_day_files(args: &Args) -> AppResult<Vec<PathBuf>> {
-    let mut day_files = collect_day_files(args.input.as_path())?;
+    let mut day_files = collect_day_files(args.input.as_path()).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            AppError::Input(InputError::InputPathNotFound(args.input.clone()))
+        } else if source.kind() == std::io::ErrorKind::InvalidInput {
+            AppError::Input(InputError::InputFileNotDay(args.input.clone()))
+        } else {
+            AppError::Runtime(RuntimeError::ReadDir {
+                path: args.input.clone(),
+                source,
+            })
+        }
+    })?;
     if args.onlystocks {
         day_files.retain(|path| {
             path.file_stem()

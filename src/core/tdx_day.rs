@@ -154,6 +154,23 @@ pub fn parse_day_file_into_columns(
     Ok(())
 }
 
+pub fn is_target_stock_code(code: &str) -> bool {
+    matches!(
+        code,
+        c if c.starts_with("sh600")
+            || c.starts_with("sh601")
+            || c.starts_with("sh603")
+            || c.starts_with("sh605")
+            || c.starts_with("sh688")
+            || c.starts_with("sz000")
+            || c.starts_with("sz001")
+            || c.starts_with("sz002")
+            || c.starts_with("sz003")
+            || c.starts_with("sz004")
+            || c.starts_with("sz300")
+    )
+}
+
 fn parse_day_record(code: &str, chunk: &[u8]) -> Result<OhlcvRow, Box<dyn std::error::Error>> {
     let date_raw = u32_from_le_bytes(chunk, 0)?;
     let date = format_date(date_raw)?;
@@ -215,7 +232,7 @@ fn code_from_path(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OhlcvColumns, collect_day_files, parse_day_file, parse_day_file_into_columns};
+    use super::{collect_day_files, parse_day_file, parse_day_file_into_columns, OhlcvColumns};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
