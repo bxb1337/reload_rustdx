@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::core::tdx_gbbq::GbbqLookup;
+
 #[derive(Debug, Clone)]
 pub struct OhlcvRow {
     pub code: String,
@@ -11,6 +13,10 @@ pub struct OhlcvRow {
     pub low: f64,
     pub close: f64,
     pub volume: i64,
+    pub bonus_shares: Option<f64>,
+    pub cash_dividend: Option<f64>,
+    pub rights_issue_shares: Option<f64>,
+    pub rights_issue_price: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -22,6 +28,10 @@ pub struct OhlcvColumns {
     pub lows: Vec<f64>,
     pub closes: Vec<f64>,
     pub volumes: Vec<i64>,
+    pub bonus_shares: Vec<Option<f64>>,
+    pub cash_dividend: Vec<Option<f64>>,
+    pub rights_issue_shares: Vec<Option<f64>>,
+    pub rights_issue_price: Vec<Option<f64>>,
 }
 
 impl OhlcvColumns {
@@ -33,6 +43,10 @@ impl OhlcvColumns {
         self.lows.reserve(additional);
         self.closes.reserve(additional);
         self.volumes.reserve(additional);
+        self.bonus_shares.reserve(additional);
+        self.cash_dividend.reserve(additional);
+        self.rights_issue_shares.reserve(additional);
+        self.rights_issue_price.reserve(additional);
     }
 
     fn push_row(&mut self, row: OhlcvRow) {
@@ -43,6 +57,10 @@ impl OhlcvColumns {
         self.lows.push(row.low);
         self.closes.push(row.close);
         self.volumes.push(row.volume);
+        self.bonus_shares.push(row.bonus_shares);
+        self.cash_dividend.push(row.cash_dividend);
+        self.rights_issue_shares.push(row.rights_issue_shares);
+        self.rights_issue_price.push(row.rights_issue_price);
     }
 }
 
@@ -109,7 +127,7 @@ pub fn parse_day_file(path: &Path) -> Result<Vec<OhlcvRow>, Box<dyn std::error::
         .chunks_exact(32)
         .enumerate()
         .map(|(idx, chunk)| {
-            parse_day_record(&code, chunk).map_err(|err| {
+            parse_day_record(&code, chunk, None).map_err(|err| {
                 format!(
                     "Failed to parse '{}' at record #{}: {err}",
                     path.display(),
@@ -126,6 +144,7 @@ pub fn parse_day_file(path: &Path) -> Result<Vec<OhlcvRow>, Box<dyn std::error::
 pub fn parse_day_file_into_columns(
     path: &Path,
     columns: &mut OhlcvColumns,
+    gbbq_lookup: Option<&GbbqLookup>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = fs::read(path)?;
     if bytes.len() % 32 != 0 {
@@ -141,7 +160,7 @@ pub fn parse_day_file_into_columns(
     columns.reserve(records);
 
     for (idx, chunk) in bytes.chunks_exact(32).enumerate() {
-        let row = parse_day_record(&code, chunk).map_err(|err| {
+        let row = parse_day_record(&code, chunk, gbbq_lookup).map_err(|err| {
             format!(
                 "Failed to parse '{}' at record #{}: {err}",
                 path.display(),
@@ -171,7 +190,11 @@ pub fn is_target_stock_code(code: &str) -> bool {
     )
 }
 
-fn parse_day_record(code: &str, chunk: &[u8]) -> Result<OhlcvRow, Box<dyn std::error::Error>> {
+fn parse_day_record(
+    code: &str,
+    chunk: &[u8],
+    gbbq_lookup: Option<&GbbqLookup>,
+) -> Result<OhlcvRow, Box<dyn std::error::Error>> {
     let date_raw = u32_from_le_bytes(chunk, 0)?;
     let date = format_date(date_raw)?;
 
@@ -180,6 +203,9 @@ fn parse_day_record(code: &str, chunk: &[u8]) -> Result<OhlcvRow, Box<dyn std::e
     let low = u32_from_le_bytes(chunk, 12)? as f64 / 100.0;
     let close = u32_from_le_bytes(chunk, 16)? as f64 / 100.0;
     let volume = i64::from(u32_from_le_bytes(chunk, 24)?);
+    let gbbq_row = gbbq_lookup
+        .and_then(|by_code| by_code.get(code))
+        .and_then(|by_date| by_date.get(&date));
 
     Ok(OhlcvRow {
         code: code.to_owned(),
@@ -189,6 +215,10 @@ fn parse_day_record(code: &str, chunk: &[u8]) -> Result<OhlcvRow, Box<dyn std::e
         low,
         close,
         volume,
+        bonus_shares: gbbq_row.map(|row| row.bonus_shares),
+        cash_dividend: gbbq_row.map(|row| row.cash_dividend),
+        rights_issue_shares: gbbq_row.map(|row| row.rights_issue_shares),
+        rights_issue_price: gbbq_row.map(|row| row.rights_issue_price),
     })
 }
 
@@ -232,7 +262,9 @@ fn code_from_path(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_day_files, parse_day_file, parse_day_file_into_columns, OhlcvColumns};
+    use super::{OhlcvColumns, collect_day_files, parse_day_file, parse_day_file_into_columns};
+    use crate::core::tdx_gbbq::{GbbqLookup, GbbqRecord};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -322,7 +354,8 @@ mod tests {
         fs::write(&path, valid_day_record()).expect("write temp day file");
 
         let mut columns = OhlcvColumns::default();
-        parse_day_file_into_columns(&path, &mut columns).expect("parse day file into columns");
+        parse_day_file_into_columns(&path, &mut columns, None)
+            .expect("parse day file into columns");
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&root);
@@ -334,6 +367,46 @@ mod tests {
         assert_eq!(columns.lows, vec![12.0]);
         assert_eq!(columns.closes, vec![12.5]);
         assert_eq!(columns.volumes, vec![10_000]);
+        assert_eq!(columns.bonus_shares, vec![None]);
+        assert_eq!(columns.cash_dividend, vec![None]);
+        assert_eq!(columns.rights_issue_shares, vec![None]);
+        assert_eq!(columns.rights_issue_price, vec![None]);
+    }
+
+    #[test]
+    fn parse_day_file_into_columns_merges_matching_gbbq_record() {
+        let mut root = std::env::temp_dir();
+        root.push(unique_name("dir"));
+        fs::create_dir_all(&root).expect("create temp directory");
+
+        let mut path = root.clone();
+        path.push("sz000001.day");
+        fs::write(&path, valid_day_record()).expect("write temp day file");
+
+        let mut columns = OhlcvColumns::default();
+        let mut by_date = HashMap::new();
+        by_date.insert(
+            "2024-01-31".to_owned(),
+            GbbqRecord {
+                bonus_shares: 1.2,
+                cash_dividend: 0.5,
+                rights_issue_shares: 0.8,
+                rights_issue_price: 9.9,
+            },
+        );
+        let mut lookup = GbbqLookup::new();
+        lookup.insert("sz000001".to_owned(), by_date);
+
+        parse_day_file_into_columns(&path, &mut columns, Some(&lookup))
+            .expect("parse day file into columns");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(columns.bonus_shares, vec![Some(1.2)]);
+        assert_eq!(columns.cash_dividend, vec![Some(0.5)]);
+        assert_eq!(columns.rights_issue_shares, vec![Some(0.8)]);
+        assert_eq!(columns.rights_issue_price, vec![Some(9.9)]);
     }
 
     fn unique_name(suffix: &str) -> PathBuf {

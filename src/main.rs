@@ -5,9 +5,13 @@ mod core;
 mod error;
 
 use cli::Args;
+use cli::args::AdjustedMode;
+use core::hfq::build_hfq_adjusted_prices;
+use core::qfq::build_qfq_adjusted_prices;
 use core::tdx_day::{
     OhlcvColumns, collect_day_files, is_target_stock_code, parse_day_file_into_columns,
 };
+use core::tdx_gbbq::{GbbqLookup, parse_gbbq_file};
 use error::{AppError, AppResult, InputError, OutputError, ParseError, RuntimeError};
 use polars::prelude::{CsvWriter, DataFrame, NamedFrom, SerWriter, Series};
 use std::collections::VecDeque;
@@ -25,24 +29,65 @@ struct ParseMessage {
 struct StockBatchCsvWriter {
     output: File,
     output_path: PathBuf,
+    qfq_output: Option<File>,
+    qfq_output_path: Option<PathBuf>,
+    hfq_output: Option<File>,
+    hfq_output_path: Option<PathBuf>,
     include_header: bool,
+    include_qfq_header: bool,
+    include_hfq_header: bool,
     max_stocks_per_batch: usize,
     pending_stocks: usize,
+    include_gbbq: bool,
+    adjusted_mode: AdjustedMode,
     buffered: OhlcvColumns,
 }
 
 impl StockBatchCsvWriter {
-    fn new(output_path: &Path, max_stocks_per_batch: usize) -> AppResult<Self> {
+    fn new(
+        output_path: &Path,
+        max_stocks_per_batch: usize,
+        include_gbbq: bool,
+        adjusted_mode: AdjustedMode,
+    ) -> AppResult<Self> {
         let output = File::create(output_path).map_err(|source| OutputError::OpenOutput {
             path: output_path.to_path_buf(),
             source,
         })?;
+        let (qfq_output, qfq_output_path) = if include_gbbq && adjusted_mode.includes_qfq() {
+            let qfq_path = resolve_adjusted_output_path(output_path, AdjustedMode::Qfq);
+            let qfq_file = File::create(&qfq_path).map_err(|source| OutputError::OpenOutput {
+                path: qfq_path.clone(),
+                source,
+            })?;
+            (Some(qfq_file), Some(qfq_path))
+        } else {
+            (None, None)
+        };
+        let (hfq_output, hfq_output_path) = if include_gbbq && adjusted_mode.includes_hfq() {
+            let hfq_path = resolve_adjusted_output_path(output_path, AdjustedMode::Hfq);
+            let hfq_file = File::create(&hfq_path).map_err(|source| OutputError::OpenOutput {
+                path: hfq_path.clone(),
+                source,
+            })?;
+            (Some(hfq_file), Some(hfq_path))
+        } else {
+            (None, None)
+        };
         Ok(Self {
             output,
             output_path: output_path.to_path_buf(),
+            qfq_output,
+            qfq_output_path,
+            hfq_output,
+            hfq_output_path,
             include_header: true,
+            include_qfq_header: true,
+            include_hfq_header: true,
             max_stocks_per_batch: max_stocks_per_batch.max(1),
             pending_stocks: 0,
+            include_gbbq,
+            adjusted_mode,
             buffered: OhlcvColumns::default(),
         })
     }
@@ -65,7 +110,18 @@ impl StockBatchCsvWriter {
             return Ok(());
         }
 
-        let mut df = dataframe_from_columns(std::mem::take(&mut self.buffered))?;
+        let mut df = dataframe_from_columns(std::mem::take(&mut self.buffered), self.include_gbbq)?;
+        let mut qfq_adjusted_df = if self.include_gbbq && self.adjusted_mode.includes_qfq() {
+            Some(build_qfq_adjusted_prices(df.clone())?)
+        } else {
+            None
+        };
+        let mut hfq_adjusted_df = if self.include_gbbq && self.adjusted_mode.includes_hfq() {
+            Some(build_hfq_adjusted_prices(df.clone())?)
+        } else {
+            None
+        };
+
         CsvWriter::new(&mut self.output)
             .include_header(self.include_header)
             .finish(&mut df)
@@ -73,6 +129,37 @@ impl StockBatchCsvWriter {
                 path: self.output_path.clone(),
                 source,
             })?;
+
+        if let (Some(adjusted_output), Some(adjusted_path), Some(adjusted_df)) = (
+            self.qfq_output.as_mut(),
+            self.qfq_output_path.as_ref(),
+            qfq_adjusted_df.as_mut(),
+        ) {
+            CsvWriter::new(adjusted_output)
+                .include_header(self.include_qfq_header)
+                .finish(adjusted_df)
+                .map_err(|source| OutputError::WriteCsv {
+                    path: adjusted_path.clone(),
+                    source,
+                })?;
+            self.include_qfq_header = false;
+        }
+
+        if let (Some(adjusted_output), Some(adjusted_path), Some(adjusted_df)) = (
+            self.hfq_output.as_mut(),
+            self.hfq_output_path.as_ref(),
+            hfq_adjusted_df.as_mut(),
+        ) {
+            CsvWriter::new(adjusted_output)
+                .include_header(self.include_hfq_header)
+                .finish(adjusted_df)
+                .map_err(|source| OutputError::WriteCsv {
+                    path: adjusted_path.clone(),
+                    source,
+                })?;
+            self.include_hfq_header = false;
+        }
+
         self.include_header = false;
         self.pending_stocks = 0;
         Ok(())
@@ -85,8 +172,16 @@ fn main() -> AppResult<()> {
     validate_gbbq_path(&args)?;
     let day_files = collect_filtered_day_files(&args)?;
     let output_path = resolve_output_path(&args)?;
+    let gbbq_lookup = load_gbbq_lookup(&args)?;
 
-    process_day_files(day_files, output_path.as_path(), args.stocks_per_batch)?;
+    process_day_files(
+        day_files,
+        output_path.as_path(),
+        args.stocks_per_batch,
+        gbbq_lookup,
+        args.gbbq.is_some(),
+        args.adjusted,
+    )?;
 
     println!(
         "Processing complete. Elapsed time: {:?}",
@@ -96,7 +191,25 @@ fn main() -> AppResult<()> {
     Ok(())
 }
 
+fn load_gbbq_lookup(args: &Args) -> AppResult<Option<GbbqLookup>> {
+    let Some(path) = args.gbbq.as_ref() else {
+        return Ok(None);
+    };
+
+    parse_gbbq_file(path).map(Some).map_err(|reason| {
+        ParseError::ParseGbbqFile {
+            path: path.clone(),
+            reason,
+        }
+        .into()
+    })
+}
+
 fn validate_gbbq_path(args: &Args) -> AppResult<()> {
+    if args.adjusted.requires_gbbq() && args.gbbq.is_none() {
+        return Err(InputError::AdjustedModeRequiresGbbq(args.adjusted.as_str().to_owned()).into());
+    }
+
     if let Some(path) = args.gbbq.as_ref()
         && !path.exists()
     {
@@ -142,19 +255,49 @@ fn resolve_output_path(args: &Args) -> AppResult<PathBuf> {
     }
 }
 
+fn resolve_adjusted_output_path(output_path: &Path, mode: AdjustedMode) -> PathBuf {
+    let suffix = match mode {
+        AdjustedMode::Qfq => "qfq",
+        AdjustedMode::Hfq => "hfq",
+        _ => "adjusted",
+    };
+
+    let adjusted_file_name = match (
+        output_path.file_stem().and_then(|stem| stem.to_str()),
+        output_path.extension().and_then(|ext| ext.to_str()),
+    ) {
+        (Some(stem), Some(ext)) => format!("{stem}_{suffix}.{ext}"),
+        (Some(stem), None) => format!("{stem}_{suffix}"),
+        _ => format!("stocks_{suffix}.csv"),
+    };
+
+    output_path.with_file_name(adjusted_file_name)
+}
+
 fn process_day_files(
     day_files: Vec<PathBuf>,
     output_path: &Path,
     stocks_per_batch: usize,
+    gbbq_lookup: Option<GbbqLookup>,
+    include_gbbq: bool,
+    adjusted_mode: AdjustedMode,
 ) -> AppResult<()> {
     let total_jobs = day_files.len();
     let available_parallelism = thread::available_parallelism().map_or(1, |n| n.get());
     let worker_count = decide_worker_count(total_jobs, available_parallelism);
 
+    let gbbq_lookup = gbbq_lookup.map(Arc::new);
     let progress = create_progress_bar(total_jobs as u64);
-    let (rx, handles) = spawn_parser_workers(day_files, worker_count);
-    let processing_result =
-        receive_and_write_results(total_jobs, rx, output_path, &progress, stocks_per_batch);
+    let (rx, handles) = spawn_parser_workers(day_files, worker_count, gbbq_lookup);
+    let processing_result = receive_and_write_results(
+        total_jobs,
+        rx,
+        output_path,
+        &progress,
+        stocks_per_batch,
+        include_gbbq,
+        adjusted_mode,
+    );
     let join_result = join_workers(handles);
 
     progress.finish_and_clear();
@@ -175,6 +318,7 @@ fn create_progress_bar(total_jobs: u64) -> ProgressBar {
 fn spawn_parser_workers(
     day_files: Vec<PathBuf>,
     worker_count: usize,
+    gbbq_lookup: Option<Arc<GbbqLookup>>,
 ) -> (mpsc::Receiver<ParseMessage>, Vec<thread::JoinHandle<()>>) {
     let (tx, rx) = mpsc::sync_channel::<ParseMessage>(worker_count.saturating_mul(2).max(1));
     let jobs = Arc::new(Mutex::new(VecDeque::from(day_files)));
@@ -183,6 +327,7 @@ fn spawn_parser_workers(
     for _ in 0..worker_count {
         let tx = tx.clone();
         let jobs = Arc::clone(&jobs);
+        let gbbq_lookup = gbbq_lookup.clone();
         let handle = thread::spawn(move || {
             loop {
                 let next_path = match jobs.lock() {
@@ -195,9 +340,10 @@ fn spawn_parser_workers(
                 };
 
                 let mut columns = OhlcvColumns::default();
-                let result = parse_day_file_into_columns(&path, &mut columns)
-                    .map(|_| columns)
-                    .map_err(|err| err.to_string());
+                let result =
+                    parse_day_file_into_columns(&path, &mut columns, gbbq_lookup.as_deref())
+                        .map(|_| columns)
+                        .map_err(|err| err.to_string());
                 if tx.send(ParseMessage { path, result }).is_err() {
                     break;
                 }
@@ -216,8 +362,11 @@ fn receive_and_write_results(
     output_path: &Path,
     progress: &ProgressBar,
     stocks_per_batch: usize,
+    include_gbbq: bool,
+    adjusted_mode: AdjustedMode,
 ) -> AppResult<()> {
-    let mut writer = StockBatchCsvWriter::new(output_path, stocks_per_batch)?;
+    let mut writer =
+        StockBatchCsvWriter::new(output_path, stocks_per_batch, include_gbbq, adjusted_mode)?;
 
     for _ in 0..total_jobs {
         let message = rx
@@ -259,21 +408,27 @@ fn decide_worker_count(total_jobs: usize, available_parallelism: usize) -> usize
     total_jobs.min(available_parallelism.max(1))
 }
 
-fn dataframe_from_columns(columns: OhlcvColumns) -> AppResult<DataFrame> {
+fn dataframe_from_columns(columns: OhlcvColumns, include_gbbq: bool) -> AppResult<DataFrame> {
     let rows = columns.codes.len();
-    Ok(DataFrame::new(
-        rows,
-        vec![
-            Series::new("code".into(), columns.codes).into(),
-            Series::new("date".into(), columns.dates).into(),
-            Series::new("open".into(), columns.opens).into(),
-            Series::new("high".into(), columns.highs).into(),
-            Series::new("low".into(), columns.lows).into(),
-            Series::new("close".into(), columns.closes).into(),
-            Series::new("volume".into(), columns.volumes).into(),
-        ],
-    )
-    .map_err(OutputError::BuildDataFrame)?)
+    let mut cols = vec![
+        Series::new("code".into(), columns.codes).into(),
+        Series::new("date".into(), columns.dates).into(),
+        Series::new("open".into(), columns.opens).into(),
+        Series::new("high".into(), columns.highs).into(),
+        Series::new("low".into(), columns.lows).into(),
+        Series::new("close".into(), columns.closes).into(),
+        Series::new("volume".into(), columns.volumes).into(),
+    ];
+    if include_gbbq {
+        cols.push(Series::new("bonus_shares".into(), columns.bonus_shares).into());
+        cols.push(Series::new("cash_dividend".into(), columns.cash_dividend).into());
+        cols.push(Series::new("rights_issue_shares".into(), columns.rights_issue_shares).into());
+        cols.push(Series::new("rights_issue_price".into(), columns.rights_issue_price).into());
+    }
+
+    DataFrame::new(rows, cols)
+        .map_err(OutputError::BuildDataFrame)
+        .map_err(Into::into)
 }
 
 fn append_columns(target: &mut OhlcvColumns, mut source: OhlcvColumns) {
@@ -284,6 +439,14 @@ fn append_columns(target: &mut OhlcvColumns, mut source: OhlcvColumns) {
     target.lows.append(&mut source.lows);
     target.closes.append(&mut source.closes);
     target.volumes.append(&mut source.volumes);
+    target.bonus_shares.append(&mut source.bonus_shares);
+    target.cash_dividend.append(&mut source.cash_dividend);
+    target
+        .rights_issue_shares
+        .append(&mut source.rights_issue_shares);
+    target
+        .rights_issue_price
+        .append(&mut source.rights_issue_price);
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use super::{
-    OhlcvColumns, collect_day_files, is_target_stock_code, parse_day_file,
-    parse_day_file_into_columns,
+    collect_day_files, is_target_stock_code, parse_day_file, parse_day_file_into_columns,
+    OhlcvColumns,
 };
 use crate::error::{AppError, InputError, ParseError};
 use std::fs;
@@ -107,7 +107,7 @@ fn parse_day_file_into_columns_appends_parsed_values() {
     fs::write(&path, valid_day_record()).expect("write temp day file");
 
     let mut columns = OhlcvColumns::default();
-    parse_day_file_into_columns(&path, &mut columns).expect("parse day file into columns");
+    parse_day_file_into_columns(&path, &mut columns, None).expect("parse day file into columns");
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&root);
@@ -119,6 +119,10 @@ fn parse_day_file_into_columns_appends_parsed_values() {
     assert_eq!(columns.lows, vec![12.0]);
     assert_eq!(columns.closes, vec![12.5]);
     assert_eq!(columns.volumes, vec![10_000]);
+    assert_eq!(columns.bonus_shares, vec![None]);
+    assert_eq!(columns.cash_dividend, vec![None]);
+    assert_eq!(columns.rights_issue_shares, vec![None]);
+    assert_eq!(columns.rights_issue_price, vec![None]);
 }
 
 #[test]

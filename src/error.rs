@@ -16,6 +16,7 @@ pub enum AppError {
 #[derive(Debug)]
 pub enum InputError {
     GbbqFileNotFound(PathBuf),
+    AdjustedModeRequiresGbbq(String),
     NoDayFilesFound(PathBuf),
     InputFileNotDay(PathBuf),
     InputPathNotFound(PathBuf),
@@ -28,6 +29,7 @@ pub enum ParseError {
     InvalidRecordBytes { offset: usize },
     InvalidDate { raw: u32 },
     ParseDayFile { path: PathBuf, reason: String },
+    ParseGbbqFile { path: PathBuf, reason: String },
 }
 
 #[derive(Debug)]
@@ -105,6 +107,10 @@ impl Display for InputError {
                 "GBBQ file '{}' was not found. Please check the path or omit --gbbq if you do not need it.",
                 path.display()
             ),
+            Self::AdjustedModeRequiresGbbq(mode) => write!(
+                f,
+                "Adjusted mode '{mode}' requires --gbbq <PATH>. Please provide a valid GBBQ file or set --adjusted none."
+            ),
             Self::NoDayFilesFound(path) => write!(
                 f,
                 "No .day files were found under '{}'. Please provide a .day file or a directory containing .day files.",
@@ -147,6 +153,13 @@ impl Display for ParseError {
             ),
             Self::ParseDayFile { path, reason } => {
                 write!(f, "Failed to parse '{}': {reason}", path.display())
+            }
+            Self::ParseGbbqFile { path, reason } => {
+                write!(
+                    f,
+                    "Failed to parse gbbq file '{}': {reason}",
+                    path.display()
+                )
             }
         }
     }

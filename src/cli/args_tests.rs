@@ -1,4 +1,4 @@
-use super::Args;
+use super::{AdjustedMode, Args};
 use clap::Parser;
 
 #[test]
@@ -35,4 +35,22 @@ fn stocks_per_batch_can_be_overridden() {
         "12",
     ]);
     assert_eq!(args.stocks_per_batch, 12);
+}
+
+#[test]
+fn adjusted_mode_defaults_to_none() {
+    let args = Args::parse_from(["reload_rustdx", "--input", "./input"]);
+    assert_eq!(args.adjusted, AdjustedMode::None);
+}
+
+#[test]
+fn adjusted_mode_parses_hfq() {
+    let args = Args::parse_from(["reload_rustdx", "--input", "./input", "--adjusted", "hfq"]);
+    assert_eq!(args.adjusted, AdjustedMode::Hfq);
+}
+
+#[test]
+fn adjusted_mode_parses_both() {
+    let args = Args::parse_from(["reload_rustdx", "--input", "./input", "--adjusted", "both"]);
+    assert_eq!(args.adjusted, AdjustedMode::Both);
 }
