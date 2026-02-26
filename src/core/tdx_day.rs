@@ -84,15 +84,35 @@ pub fn collect_day_files(input: &Path) -> Result<Vec<PathBuf>, io::Error> {
 }
 
 fn collect_day_files_in_dir(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), io::Error> {
+    use rayon::prelude::*;
+
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    let mut local_files: Vec<PathBuf> = Vec::new();
+
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
-            collect_day_files_in_dir(&path, files)?;
-            continue;
+            subdirs.push(path);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("day") {
+            local_files.push(path);
         }
+    }
 
-        if path.extension().and_then(|s| s.to_str()) == Some("day") {
-            files.push(path);
+    files.append(&mut local_files);
+
+    if !subdirs.is_empty() {
+        // Scan subdirectories in parallel; each collects into its own Vec.
+        let sub_results: Vec<Result<Vec<PathBuf>, io::Error>> = subdirs
+            .into_par_iter()
+            .map(|sub| {
+                let mut sub_files = Vec::new();
+                collect_day_files_in_dir(&sub, &mut sub_files)?;
+                Ok(sub_files)
+            })
+            .collect();
+
+        for result in sub_results {
+            files.append(&mut result?);
         }
     }
 
