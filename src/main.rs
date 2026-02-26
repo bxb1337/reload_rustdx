@@ -14,12 +14,12 @@ use core::tdx_day::{
 use core::tdx_gbbq::{GbbqLookup, parse_gbbq_file};
 use error::{AppError, AppResult, InputError, OutputError, ParseError, RuntimeError};
 use polars::prelude::{CsvWriter, DataFrame, NamedFrom, SerWriter, Series};
-use std::collections::VecDeque;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Instant;
+use rayon::prelude::*;
 
 struct ParseMessage {
     path: PathBuf,
@@ -284,11 +284,11 @@ fn process_day_files(
 ) -> AppResult<()> {
     let total_jobs = day_files.len();
     let available_parallelism = thread::available_parallelism().map_or(1, |n| n.get());
-    let worker_count = decide_worker_count(total_jobs, available_parallelism);
+    let _worker_count = decide_worker_count(total_jobs, available_parallelism);
 
     let gbbq_lookup = gbbq_lookup.map(Arc::new);
     let progress = create_progress_bar(total_jobs as u64);
-    let (rx, handles) = spawn_parser_workers(day_files, worker_count, gbbq_lookup);
+    let (rx, handles) = spawn_parser_workers(day_files, 0, gbbq_lookup);
     let processing_result = receive_and_write_results(
         total_jobs,
         rx,
@@ -317,43 +317,28 @@ fn create_progress_bar(total_jobs: u64) -> ProgressBar {
 
 fn spawn_parser_workers(
     day_files: Vec<PathBuf>,
-    worker_count: usize,
+    _worker_count: usize, // Rayon manages its own pool; parameter kept for call-site compat
     gbbq_lookup: Option<Arc<GbbqLookup>>,
 ) -> (mpsc::Receiver<ParseMessage>, Vec<thread::JoinHandle<()>>) {
-    let (tx, rx) = mpsc::sync_channel::<ParseMessage>(worker_count.saturating_mul(2).max(1));
-    let jobs = Arc::new(Mutex::new(VecDeque::from(day_files)));
-    let mut handles = Vec::with_capacity(worker_count);
+    // Channel large enough that Rayon workers are never blocked waiting for the main thread.
+    let buf_size = day_files.len().min(4096).max(1);
+    let (tx, rx) = mpsc::sync_channel::<ParseMessage>(buf_size);
 
-    for _ in 0..worker_count {
-        let tx = tx.clone();
-        let jobs = Arc::clone(&jobs);
-        let gbbq_lookup = gbbq_lookup.clone();
-        let handle = thread::spawn(move || {
-            loop {
-                let next_path = match jobs.lock() {
-                    Ok(mut queue) => queue.pop_front(),
-                    Err(_) => None,
-                };
-
-                let Some(path) = next_path else {
-                    break;
-                };
-
-                let mut columns = OhlcvColumns::default();
-                let result =
-                    parse_day_file_into_columns(&path, &mut columns, gbbq_lookup.as_deref())
-                        .map(|_| columns)
-                        .map_err(|err| err.to_string());
-                if tx.send(ParseMessage { path, result }).is_err() {
-                    break;
-                }
-            }
+    // Single coordinator thread drives the Rayon par_iter.
+    // Rayon internally spawns worker threads from its global pool.
+    let handle = thread::spawn(move || {
+        day_files.into_par_iter().for_each_with(tx, |tx, path| {
+            let mut columns = OhlcvColumns::default();
+            let result =
+                parse_day_file_into_columns(&path, &mut columns, gbbq_lookup.as_deref())
+                    .map(|_| columns)
+                    .map_err(|err| err.to_string());
+            // Ignore send error: receiver may have exited on fatal write error.
+            let _ = tx.send(ParseMessage { path, result });
         });
-        handles.push(handle);
-    }
+    });
 
-    drop(tx);
-    (rx, handles)
+    (rx, vec![handle])
 }
 
 fn receive_and_write_results(
