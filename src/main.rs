@@ -111,17 +111,8 @@ impl StockBatchCsvWriter {
         }
 
         let mut df = dataframe_from_columns(std::mem::take(&mut self.buffered), self.include_gbbq)?;
-        let mut qfq_adjusted_df = if self.include_gbbq && self.adjusted_mode.includes_qfq() {
-            Some(build_qfq_adjusted_prices(df.clone())?)
-        } else {
-            None
-        };
-        let mut hfq_adjusted_df = if self.include_gbbq && self.adjusted_mode.includes_hfq() {
-            Some(build_hfq_adjusted_prices(df.clone())?)
-        } else {
-            None
-        };
 
+        // Write raw CSV first (mutable borrow; df still alive after this).
         CsvWriter::new(&mut self.output)
             .include_header(self.include_header)
             .finish(&mut df)
@@ -129,6 +120,23 @@ impl StockBatchCsvWriter {
                 path: self.output_path.clone(),
                 source,
             })?;
+        self.include_header = false;
+
+        // Compute adjusted DataFrames — clone only when both modes are needed.
+        let (mut qfq_adjusted_df, mut hfq_adjusted_df) = match (
+            self.include_gbbq && self.adjusted_mode.includes_qfq(),
+            self.include_gbbq && self.adjusted_mode.includes_hfq(),
+        ) {
+            (true, true) => {
+                // Need both: clone for qfq, move for hfq (saves one full DataFrame clone).
+                let qfq = build_qfq_adjusted_prices(df.clone())?;
+                let hfq = build_hfq_adjusted_prices(df)?;
+                (Some(qfq), Some(hfq))
+            }
+            (true, false) => (Some(build_qfq_adjusted_prices(df)?), None),
+            (false, true) => (None, Some(build_hfq_adjusted_prices(df)?)),
+            (false, false) => (None, None),
+        };
 
         if let (Some(adjusted_output), Some(adjusted_path), Some(adjusted_df)) = (
             self.qfq_output.as_mut(),
@@ -160,7 +168,6 @@ impl StockBatchCsvWriter {
             self.include_hfq_header = false;
         }
 
-        self.include_header = false;
         self.pending_stocks = 0;
         Ok(())
     }
