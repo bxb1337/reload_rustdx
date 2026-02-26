@@ -291,11 +291,10 @@ fn process_day_files(
 ) -> AppResult<()> {
     let total_jobs = day_files.len();
     let available_parallelism = thread::available_parallelism().map_or(1, |n| n.get());
-    let _worker_count = decide_worker_count(total_jobs, available_parallelism);
 
     let gbbq_lookup = gbbq_lookup.map(Arc::new);
     let progress = create_progress_bar(total_jobs as u64);
-    let (rx, handles) = spawn_parser_workers(day_files, 0, gbbq_lookup);
+    let (rx, handles) = spawn_parser_workers(day_files, available_parallelism, gbbq_lookup);
     let processing_result = receive_and_write_results(
         total_jobs,
         rx,
@@ -324,11 +323,12 @@ fn create_progress_bar(total_jobs: u64) -> ProgressBar {
 
 fn spawn_parser_workers(
     day_files: Vec<PathBuf>,
-    _worker_count: usize, // Rayon manages its own pool; parameter kept for call-site compat
+    worker_count: usize,
     gbbq_lookup: Option<Arc<GbbqLookup>>,
 ) -> (mpsc::Receiver<ParseMessage>, Vec<thread::JoinHandle<()>>) {
-    // Channel large enough that Rayon workers are never blocked waiting for the main thread.
-    let buf_size = day_files.len().clamp(1, 4096);
+    // Buffer just large enough to keep Rayon workers fed without excessive memory from
+    // thousands of in-flight OhlcvColumns.
+    let buf_size = (worker_count * 2).max(1);
     let (tx, rx) = mpsc::sync_channel::<ParseMessage>(buf_size);
 
     // Single coordinator thread drives the Rayon par_iter.
@@ -392,6 +392,7 @@ fn join_workers(handles: Vec<thread::JoinHandle<()>>) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn decide_worker_count(total_jobs: usize, available_parallelism: usize) -> usize {
     if total_jobs == 0 {
         return 1;
