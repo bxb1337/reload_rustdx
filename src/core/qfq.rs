@@ -159,7 +159,6 @@ pub(crate) fn build_qfq_adjusted_prices(df: DataFrame) -> AppResult<DataFrame> {
             col("rights_issue_shares"),
             col("rights_issue_price"),
         ])
-        .sort(["code", "date"], SortMultipleOptions::default())
         .collect()
         .map_err(OutputError::BuildDataFrame)
         .map_err(Into::into)
