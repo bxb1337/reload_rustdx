@@ -1,19 +1,166 @@
-use crate::core::qfq::build_qfq_adjusted_prices;
-use crate::error::AppResult;
-use polars::prelude::DataFrame;
+use crate::error::{AppResult, OutputError};
+use polars::prelude::{DataFrame, IntoLazy, NamedFrom, Series, SortMultipleOptions, col};
 
 pub(crate) fn build_hfq_adjusted_prices(df: DataFrame) -> AppResult<DataFrame> {
-    build_qfq_adjusted_prices(df)
+    let mut sorted = df
+        .lazy()
+        .sort(["code", "date"], SortMultipleOptions::default())
+        .collect()
+        .map_err(OutputError::BuildDataFrame)?;
+
+    let row_count = sorted.height();
+    let code_values = sorted
+        .column("code")
+        .map_err(OutputError::BuildDataFrame)?
+        .str()
+        .map_err(OutputError::BuildDataFrame)?;
+    let close_values = sorted
+        .column("close")
+        .map_err(OutputError::BuildDataFrame)?
+        .f64()
+        .map_err(OutputError::BuildDataFrame)?;
+    let open_values = sorted
+        .column("open")
+        .map_err(OutputError::BuildDataFrame)?
+        .f64()
+        .map_err(OutputError::BuildDataFrame)?;
+    let high_values = sorted
+        .column("high")
+        .map_err(OutputError::BuildDataFrame)?
+        .f64()
+        .map_err(OutputError::BuildDataFrame)?;
+    let low_values = sorted
+        .column("low")
+        .map_err(OutputError::BuildDataFrame)?
+        .f64()
+        .map_err(OutputError::BuildDataFrame)?;
+    let cash_values = sorted
+        .column("cash_dividend")
+        .map_err(OutputError::BuildDataFrame)?
+        .f64()
+        .map_err(OutputError::BuildDataFrame)?;
+    let bonus_values = sorted
+        .column("bonus_shares")
+        .map_err(OutputError::BuildDataFrame)?
+        .f64()
+        .map_err(OutputError::BuildDataFrame)?;
+    let rights_values = sorted
+        .column("rights_issue_shares")
+        .map_err(OutputError::BuildDataFrame)?
+        .f64()
+        .map_err(OutputError::BuildDataFrame)?;
+    let rights_price_values = sorted
+        .column("rights_issue_price")
+        .map_err(OutputError::BuildDataFrame)?
+        .f64()
+        .map_err(OutputError::BuildDataFrame)?;
+
+    let closes = close_values
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let opens = open_values
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let highs = high_values
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let lows = low_values
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let cash_dividend = cash_values
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let bonus_shares = bonus_values
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let rights_issue_shares = rights_values
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    let rights_issue_price = rights_price_values
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect::<Vec<_>>();
+
+    let mut adjusted_open = opens.clone();
+    let mut adjusted_high = highs.clone();
+    let mut adjusted_low = lows.clone();
+    let mut adjusted_close = closes.clone();
+
+    let mut start = 0_usize;
+    while start < row_count {
+        let mut end = start + 1;
+        while end < row_count && code_values.get(end) == code_values.get(start) {
+            end += 1;
+        }
+
+        let mut cumulative_scale = 1.0_f64;
+        let mut cumulative_cash_term = 0.0_f64;
+
+        for idx in start..end {
+            let alpha = cash_dividend[idx];
+            let beta = bonus_shares[idx];
+            let gamma = rights_issue_shares[idx];
+            let epsilon = rights_issue_price[idx];
+
+            cumulative_cash_term += cumulative_scale * (0.1 * alpha - 0.1 * gamma * epsilon);
+            cumulative_scale *= (1.0 + 0.1 * beta) * (1.0 + 0.1 * gamma);
+
+            adjusted_open[idx] = opens[idx] * cumulative_scale + cumulative_cash_term;
+            adjusted_high[idx] = highs[idx] * cumulative_scale + cumulative_cash_term;
+            adjusted_low[idx] = lows[idx] * cumulative_scale + cumulative_cash_term;
+            adjusted_close[idx] = closes[idx] * cumulative_scale + cumulative_cash_term;
+        }
+
+        start = end;
+    }
+
+    sorted
+        .with_column(Series::new("open".into(), adjusted_open).into())
+        .map_err(OutputError::BuildDataFrame)?;
+    sorted
+        .with_column(Series::new("high".into(), adjusted_high).into())
+        .map_err(OutputError::BuildDataFrame)?;
+    sorted
+        .with_column(Series::new("low".into(), adjusted_low).into())
+        .map_err(OutputError::BuildDataFrame)?;
+    sorted
+        .with_column(Series::new("close".into(), adjusted_close).into())
+        .map_err(OutputError::BuildDataFrame)?;
+
+    sorted
+        .lazy()
+        .select([
+            col("code"),
+            col("date"),
+            col("open"),
+            col("high"),
+            col("low"),
+            col("close"),
+            col("volume"),
+            col("bonus_shares"),
+            col("cash_dividend"),
+            col("rights_issue_shares"),
+            col("rights_issue_price"),
+        ])
+        .collect()
+        .map_err(OutputError::BuildDataFrame)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::build_hfq_adjusted_prices;
-    use crate::core::qfq::build_qfq_adjusted_prices;
     use polars::prelude::{DataFrame, NamedFrom, Series};
 
     #[test]
-    fn hfq_uses_same_adjustment_series_as_reference_dataset() {
+    fn hfq_applies_forward_adjustment_scale_and_cash_term() {
         let rows = 3;
         let df = DataFrame::new(
             rows,
@@ -36,47 +183,47 @@ mod tests {
                     ],
                 )
                 .into(),
-                Series::new("open".into(), vec![10.0_f64, 12.0, 15.0]).into(),
-                Series::new("high".into(), vec![10.5_f64, 12.5, 15.5]).into(),
-                Series::new("low".into(), vec![9.8_f64, 11.8, 14.8]).into(),
-                Series::new("close".into(), vec![10.0_f64, 12.0, 15.0]).into(),
+                Series::new("open".into(), vec![100.0_f64, 110.0, 120.0]).into(),
+                Series::new("high".into(), vec![101.0_f64, 111.0, 121.0]).into(),
+                Series::new("low".into(), vec![99.0_f64, 109.0, 119.0]).into(),
+                Series::new("close".into(), vec![100.0_f64, 110.0, 120.0]).into(),
                 Series::new("volume".into(), vec![10_000_i64, 12_000, 13_000]).into(),
-                Series::new("bonus_shares".into(), vec![None, Some(1.0), Some(2.0)]).into(),
-                Series::new("cash_dividend".into(), vec![None, Some(1.0), Some(0.5)]).into(),
+                Series::new("bonus_shares".into(), vec![None, Some(10.0), None]).into(),
+                Series::new("cash_dividend".into(), vec![None, Some(10.0), None]).into(),
                 Series::new(
                     "rights_issue_shares".into(),
-                    vec![None, Some(2.0), Some(1.0)],
+                    vec![None::<f64>, None::<f64>, None::<f64>],
                 )
                 .into(),
                 Series::new(
                     "rights_issue_price".into(),
-                    vec![None, Some(8.0), Some(9.0)],
+                    vec![None::<f64>, None::<f64>, None::<f64>],
                 )
                 .into(),
             ],
         )
         .expect("build dataframe");
 
-        let hfq = build_hfq_adjusted_prices(df.clone()).expect("build hfq adjusted prices");
-        let qfq = build_qfq_adjusted_prices(df).expect("build qfq adjusted prices");
+        let hfq = build_hfq_adjusted_prices(df).expect("build hfq adjusted prices");
 
-        assert_eq!(hfq.shape(), qfq.shape());
-        for column in ["open", "high", "low", "close"] {
-            let hfq_values = hfq
-                .column(column)
-                .expect("hfq column")
-                .f64()
-                .expect("hfq as f64");
-            let qfq_values = qfq
-                .column(column)
-                .expect("qfq column")
-                .f64()
-                .expect("qfq as f64");
-            for idx in 0..rows {
-                let hfq_value = hfq_values.get(idx).expect("hfq value");
-                let qfq_value = qfq_values.get(idx).expect("qfq value");
-                assert!((hfq_value - qfq_value).abs() < 1e-12);
-            }
-        }
+        let opens = hfq
+            .column("open")
+            .expect("open column")
+            .f64()
+            .expect("open as f64");
+        let closes = hfq
+            .column("close")
+            .expect("close column")
+            .f64()
+            .expect("close as f64");
+
+        assert!((opens.get(0).expect("row0 open") - 100.0).abs() < 1e-12);
+        assert!((closes.get(0).expect("row0 close") - 100.0).abs() < 1e-12);
+
+        assert!((opens.get(1).expect("row1 open") - 221.0).abs() < 1e-12);
+        assert!((closes.get(1).expect("row1 close") - 221.0).abs() < 1e-12);
+
+        assert!((opens.get(2).expect("row2 open") - 241.0).abs() < 1e-12);
+        assert!((closes.get(2).expect("row2 close") - 241.0).abs() < 1e-12);
     }
 }
