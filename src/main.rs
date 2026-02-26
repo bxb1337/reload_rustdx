@@ -14,12 +14,12 @@ use core::tdx_day::{
 use core::tdx_gbbq::{GbbqLookup, parse_gbbq_file};
 use error::{AppError, AppResult, InputError, OutputError, ParseError, RuntimeError};
 use polars::prelude::{CsvWriter, DataFrame, NamedFrom, SerWriter, Series};
+use rayon::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Instant;
-use rayon::prelude::*;
 
 struct ParseMessage {
     path: PathBuf,
@@ -328,7 +328,7 @@ fn spawn_parser_workers(
     gbbq_lookup: Option<Arc<GbbqLookup>>,
 ) -> (mpsc::Receiver<ParseMessage>, Vec<thread::JoinHandle<()>>) {
     // Channel large enough that Rayon workers are never blocked waiting for the main thread.
-    let buf_size = day_files.len().min(4096).max(1);
+    let buf_size = day_files.len().clamp(1, 4096);
     let (tx, rx) = mpsc::sync_channel::<ParseMessage>(buf_size);
 
     // Single coordinator thread drives the Rayon par_iter.
@@ -336,10 +336,9 @@ fn spawn_parser_workers(
     let handle = thread::spawn(move || {
         day_files.into_par_iter().for_each_with(tx, |tx, path| {
             let mut columns = OhlcvColumns::default();
-            let result =
-                parse_day_file_into_columns(&path, &mut columns, gbbq_lookup.as_deref())
-                    .map(|_| columns)
-                    .map_err(|err| err.to_string());
+            let result = parse_day_file_into_columns(&path, &mut columns, gbbq_lookup.as_deref())
+                .map(|_| columns)
+                .map_err(|err| err.to_string());
             // Ignore send error: receiver may have exited on fatal write error.
             let _ = tx.send(ParseMessage { path, result });
         });

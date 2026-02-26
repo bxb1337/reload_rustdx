@@ -13,6 +13,7 @@ pub enum AppError {
     Output(OutputError),
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum InputError {
     GbbqFileNotFound(PathBuf),
@@ -23,6 +24,7 @@ pub enum InputError {
     InvalidFileNameUtf8(PathBuf),
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum ParseError {
     InvalidDayFileSize { path: PathBuf, size: usize },
@@ -32,6 +34,7 @@ pub enum ParseError {
     ParseGbbqFile { path: PathBuf, reason: String },
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum RuntimeError {
     ReadDir {

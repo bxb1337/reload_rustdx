@@ -340,7 +340,7 @@ fn code_from_path(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_day_files, format_date, parse_day_file, parse_day_file_into_columns, OhlcvColumns,
+        OhlcvColumns, collect_day_files, format_date, parse_day_file, parse_day_file_into_columns,
     };
     use crate::core::tdx_gbbq::{GbbqLookup, GbbqRecord};
     use std::collections::HashMap;
