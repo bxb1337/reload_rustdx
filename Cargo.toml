@@ -8,6 +8,7 @@ clap = { version = ">=4.5.57", features = ["derive"] }
 indicatif = ">=0.18.0"
 polars = { version = ">=0.53.0", features = ["lazy", "cum_agg"] }
 rayon = ">=1.10"
+reqwest = { version = ">=0.12", features = ["blocking", "rustls-tls"], default-features = false }
 zip = "2"
 
 [dev-dependencies]

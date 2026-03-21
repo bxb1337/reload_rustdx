@@ -16,11 +16,14 @@ use error::{AppError, AppResult, InputError, OutputError, ParseError, RuntimeErr
 use polars::prelude::{CsvWriter, DataFrame, NamedFrom, SerWriter, Series};
 use rayon::prelude::*;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Instant;
 use zip::ZipArchive;
+
+const REMOTE_DAY_ZIP_URL: &str = "https://data.tdx.com.cn/vipdoc/hsjday.zip";
 
 struct ParseMessage {
     path: PathBuf,
@@ -180,12 +183,27 @@ fn main() -> AppResult<()> {
     validate_input_source(&args)?;
     validate_gbbq_path(&args)?;
 
-    if args.remote_download {
-        println!("Remote download mode is not yet fully implemented. Use --input for now.");
-        return Ok(());
-    }
+    let remote_workspace: Option<PathBuf> = if args.remote_download {
+        let workspace = create_remote_workspace()?;
+        let zip_path = workspace.join("hsjday.zip");
+        download_remote_archive(REMOTE_DAY_ZIP_URL, &zip_path)?;
+        println!("Extracting archive...");
+        extract_remote_archive(&zip_path, &workspace)?;
+        let _ = std::fs::remove_file(&zip_path);
+        Some(workspace)
+    } else {
+        None
+    };
 
-    let day_files = collect_filtered_day_files(&args)?;
+    let effective_input = if let Some(ref ws) = remote_workspace {
+        ws.clone()
+    } else {
+        args.input
+            .clone()
+            .expect("input is required when not using --remote-download")
+    };
+
+    let day_files = collect_filtered_day_files_from(&effective_input, args.onlystocks)?;
     let output_path = resolve_output_path(&args)?;
     let gbbq_lookup = load_gbbq_lookup(&args)?;
 
@@ -197,6 +215,13 @@ fn main() -> AppResult<()> {
         args.gbbq.is_some(),
         args.adjusted,
     )?;
+
+    if let Some(ref ws) = remote_workspace {
+        std::fs::remove_dir_all(ws).map_err(|source| RuntimeError::CleanupTempDir {
+            path: ws.clone(),
+            source,
+        })?;
+    }
 
     println!(
         "Processing complete. Elapsed time: {:?}",
@@ -233,7 +258,6 @@ fn validate_gbbq_path(args: &Args) -> AppResult<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn create_remote_workspace() -> AppResult<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -247,7 +271,6 @@ fn create_remote_workspace() -> AppResult<PathBuf> {
     Ok(workspace)
 }
 
-#[allow(dead_code)]
 fn extract_remote_archive(zip_path: &Path, workspace: &Path) -> AppResult<()> {
     let zip_file = std::fs::File::open(zip_path).map_err(|source| RuntimeError::ReadDayFile {
         path: zip_path.to_path_buf(),
@@ -305,7 +328,75 @@ fn extract_remote_archive(zip_path: &Path, workspace: &Path) -> AppResult<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
+fn download_remote_archive(url: &str, dest: &Path) -> AppResult<()> {
+    println!("Downloading {url} ...");
+
+    let response = reqwest::blocking::Client::builder()
+        .build()
+        .and_then(|client| client.get(url).send())
+        .map_err(|e| RuntimeError::DownloadFailed {
+            url: url.to_owned(),
+            reason: e.to_string(),
+        })?;
+
+    if !response.status().is_success() {
+        return Err(RuntimeError::DownloadFailed {
+            url: url.to_owned(),
+            reason: format!("HTTP {}", response.status()),
+        }
+        .into());
+    }
+
+    let total_size = response.content_length();
+    let progress = if let Some(size) = total_size {
+        let pb = ProgressBar::new(size);
+        if let Ok(style) = ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.green/white} {bytes}/{total_bytes} ({bytes_per_sec})",
+        ) {
+            pb.set_style(style.progress_chars("=>-"));
+        }
+        pb
+    } else {
+        let pb = ProgressBar::new_spinner();
+        if let Ok(style) =
+            ProgressStyle::with_template("[{elapsed_precise}] {bytes} ({bytes_per_sec})")
+        {
+            pb.set_style(style);
+        }
+        pb
+    };
+
+    let mut out_file =
+        File::create(dest).map_err(|source| RuntimeError::CreateDownloadFile {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+
+    let mut reader = response;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf).map_err(|e| {
+            RuntimeError::DownloadFailed {
+                url: url.to_owned(),
+                reason: e.to_string(),
+            }
+        })?;
+        if n == 0 {
+            break;
+        }
+        out_file.write_all(&buf[..n]).map_err(|source| RuntimeError::CreateDownloadFile {
+            path: dest.to_path_buf(),
+            source: std::io::Error::new(source.kind(), source.to_string()),
+        })?;
+        progress.inc(n as u64);
+    }
+
+    progress.finish_and_clear();
+    println!("Download complete.");
+    Ok(())
+}
+
+#[cfg(test)]
 fn resolve_vipdoc_root(workspace: &Path) -> AppResult<PathBuf> {
     let vipdoc = workspace.join("vipdoc");
     if vipdoc.is_dir() {
@@ -326,24 +417,29 @@ fn validate_input_source(args: &Args) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_filtered_day_files(args: &Args) -> AppResult<Vec<PathBuf>> {
     let input = args
         .input
         .as_ref()
         .expect("input is required when not using --remote-download");
-    let mut day_files = collect_day_files(input.as_path()).map_err(|source| {
+    collect_filtered_day_files_from(input, args.onlystocks)
+}
+
+fn collect_filtered_day_files_from(input: &Path, onlystocks: bool) -> AppResult<Vec<PathBuf>> {
+    let mut day_files = collect_day_files(input).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
-            AppError::Input(InputError::InputPathNotFound(input.clone()))
+            AppError::Input(InputError::InputPathNotFound(input.to_path_buf()))
         } else if source.kind() == std::io::ErrorKind::InvalidInput {
-            AppError::Input(InputError::InputFileNotDay(input.clone()))
+            AppError::Input(InputError::InputFileNotDay(input.to_path_buf()))
         } else {
             AppError::Runtime(RuntimeError::ReadDir {
-                path: input.clone(),
+                path: input.to_path_buf(),
                 source,
             })
         }
     })?;
-    if args.onlystocks {
+    if onlystocks {
         day_files.retain(|path| {
             path.file_stem()
                 .and_then(|s| s.to_str())
@@ -352,7 +448,7 @@ fn collect_filtered_day_files(args: &Args) -> AppResult<Vec<PathBuf>> {
     }
 
     if day_files.is_empty() {
-        return Err(InputError::NoDayFilesFound(input.clone()).into());
+        return Err(InputError::NoDayFilesFound(input.to_path_buf()).into());
     }
 
     Ok(day_files)

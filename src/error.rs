@@ -50,6 +50,10 @@ pub enum RuntimeError {
         path: PathBuf,
         source: std::io::Error,
     },
+    DownloadFailed {
+        url: String,
+        reason: String,
+    },
     CreateTempDir {
         path: PathBuf,
         source: std::io::Error,
@@ -202,6 +206,9 @@ impl Display for RuntimeError {
             ),
             Self::ReadDayFile { path, source } => {
                 write!(f, "Failed to read .day file '{}': {source}", path.display())
+            }
+            Self::DownloadFailed { url, reason } => {
+                write!(f, "Failed to download '{url}': {reason}")
             }
             Self::CreateTempDir { path, source } => write!(
                 f,
