@@ -16,6 +16,7 @@ pub enum AppError {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum InputError {
+    InputOrRemoteDownloadRequired,
     GbbqFileNotFound(PathBuf),
     AdjustedModeRequiresGbbq(String),
     NoDayFilesFound(PathBuf),
@@ -105,6 +106,10 @@ impl Display for AppError {
 impl Display for InputError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InputOrRemoteDownloadRequired => write!(
+                f,
+                "Either --input <PATH> or --remote-download must be provided. Use --help for usage."
+            ),
             Self::GbbqFileNotFound(path) => write!(
                 f,
                 "GBBQ file '{}' was not found. Please check the path or omit --gbbq if you do not need it.",

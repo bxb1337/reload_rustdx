@@ -1,9 +1,9 @@
 use super::{
-    StockBatchCsvWriter, collect_filtered_day_files, decide_worker_count, process_day_files,
-    resolve_adjusted_output_path, validate_gbbq_path,
+    collect_filtered_day_files, decide_worker_count, process_day_files,
+    resolve_adjusted_output_path, validate_gbbq_path, validate_input_source, StockBatchCsvWriter,
 };
-use crate::cli::Args;
 use crate::cli::args::AdjustedMode;
+use crate::cli::Args;
 use crate::core::tdx_day::OhlcvColumns;
 use crate::core::tdx_gbbq::parse_gbbq_file;
 use crate::error::{AppError, InputError};
@@ -324,14 +324,76 @@ fn decide_worker_count_is_bounded_by_jobs_and_cpu() {
 }
 
 #[test]
+fn validate_input_source_requires_input_or_remote_download() {
+    let args = Args {
+        input: None,
+        output: None,
+        gbbq: None,
+        adjusted: AdjustedMode::None,
+        onlystocks: true,
+        stocks_per_batch: 30,
+        remote_download: false,
+    };
+    let result = validate_input_source(&args);
+    assert!(matches!(
+        result,
+        Err(AppError::Input(InputError::InputOrRemoteDownloadRequired))
+    ));
+}
+
+#[test]
+fn validate_input_source_accepts_local_input() {
+    let args = Args {
+        input: Some(std::env::temp_dir()),
+        output: None,
+        gbbq: None,
+        adjusted: AdjustedMode::None,
+        onlystocks: true,
+        stocks_per_batch: 30,
+        remote_download: false,
+    };
+    assert!(validate_input_source(&args).is_ok());
+}
+
+#[test]
+fn validate_input_source_accepts_remote_download_without_input() {
+    let args = Args {
+        input: None,
+        output: None,
+        gbbq: None,
+        adjusted: AdjustedMode::None,
+        onlystocks: true,
+        stocks_per_batch: 30,
+        remote_download: true,
+    };
+    assert!(validate_input_source(&args).is_ok());
+}
+
+#[test]
+fn remote_download_does_not_reach_collect_day_files_panic() {
+    let args = Args {
+        input: None,
+        output: None,
+        gbbq: None,
+        adjusted: AdjustedMode::None,
+        onlystocks: true,
+        stocks_per_batch: 30,
+        remote_download: true,
+    };
+    assert!(validate_input_source(&args).is_ok());
+    assert!(args.input.is_none());
+}
+
+#[test]
 fn validate_gbbq_path_returns_custom_error_when_file_missing() {
     let args = Args {
-        input: std::env::temp_dir(),
+        input: Some(std::env::temp_dir()),
         output: None,
         gbbq: Some(PathBuf::from("/definitely/not/exist.gbbq")),
         adjusted: AdjustedMode::None,
         onlystocks: true,
         stocks_per_batch: 30,
+        remote_download: false,
     };
 
     let result = validate_gbbq_path(&args);
@@ -344,12 +406,13 @@ fn validate_gbbq_path_returns_custom_error_when_file_missing() {
 #[test]
 fn validate_gbbq_path_requires_file_when_adjusted_mode_enabled() {
     let args = Args {
-        input: std::env::temp_dir(),
+        input: Some(std::env::temp_dir()),
         output: None,
         gbbq: None,
         adjusted: AdjustedMode::Hfq,
         onlystocks: true,
         stocks_per_batch: 30,
+        remote_download: false,
     };
 
     let result = validate_gbbq_path(&args);
@@ -366,12 +429,13 @@ fn collect_filtered_day_files_returns_custom_error_when_none_found() {
     fs::create_dir_all(&input).expect("create empty input directory");
 
     let args = Args {
-        input: input.clone(),
+        input: Some(input.clone()),
         output: None,
         gbbq: None,
         adjusted: AdjustedMode::None,
         onlystocks: true,
         stocks_per_batch: 30,
+        remote_download: false,
     };
 
     let result = collect_filtered_day_files(&args);
@@ -397,12 +461,13 @@ fn collect_filtered_day_files_keeps_only_target_stock_codes() {
     fs::write(&drop, vec![0_u8; 32]).expect("write non-target stock file");
 
     let args = Args {
-        input: input.clone(),
+        input: Some(input.clone()),
         output: None,
         gbbq: None,
         adjusted: AdjustedMode::None,
         onlystocks: true,
         stocks_per_batch: 30,
+        remote_download: false,
     };
 
     let result = collect_filtered_day_files(&args).expect("collect filtered files");

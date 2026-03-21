@@ -35,9 +35,13 @@ impl AdjustedMode {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
-    /// Input .day file or directory
+    /// Input .day file or directory. Required unless --remote-download is used.
     #[arg(short, long)]
-    pub input: PathBuf,
+    pub input: Option<PathBuf>,
+
+    /// Download the official vipdoc archive remotely instead of using a local --input path
+    #[arg(long, default_value_t = false)]
+    pub remote_download: bool,
 
     /// Optional output file path
     #[arg(short, long)]

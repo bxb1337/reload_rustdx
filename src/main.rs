@@ -176,7 +176,14 @@ impl StockBatchCsvWriter {
 fn main() -> AppResult<()> {
     let start_time = Instant::now();
     let args = Args::parse();
+    validate_input_source(&args)?;
     validate_gbbq_path(&args)?;
+
+    if args.remote_download {
+        println!("Remote download mode is not yet fully implemented. Use --input for now.");
+        return Ok(());
+    }
+
     let day_files = collect_filtered_day_files(&args)?;
     let output_path = resolve_output_path(&args)?;
     let gbbq_lookup = load_gbbq_lookup(&args)?;
@@ -225,15 +232,26 @@ fn validate_gbbq_path(args: &Args) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_input_source(args: &Args) -> AppResult<()> {
+    if args.input.is_none() && !args.remote_download {
+        return Err(InputError::InputOrRemoteDownloadRequired.into());
+    }
+    Ok(())
+}
+
 fn collect_filtered_day_files(args: &Args) -> AppResult<Vec<PathBuf>> {
-    let mut day_files = collect_day_files(args.input.as_path()).map_err(|source| {
+    let input = args
+        .input
+        .as_ref()
+        .expect("input is required when not using --remote-download");
+    let mut day_files = collect_day_files(input.as_path()).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
-            AppError::Input(InputError::InputPathNotFound(args.input.clone()))
+            AppError::Input(InputError::InputPathNotFound(input.clone()))
         } else if source.kind() == std::io::ErrorKind::InvalidInput {
-            AppError::Input(InputError::InputFileNotDay(args.input.clone()))
+            AppError::Input(InputError::InputFileNotDay(input.clone()))
         } else {
             AppError::Runtime(RuntimeError::ReadDir {
-                path: args.input.clone(),
+                path: input.clone(),
                 source,
             })
         }
@@ -247,7 +265,7 @@ fn collect_filtered_day_files(args: &Args) -> AppResult<Vec<PathBuf>> {
     }
 
     if day_files.is_empty() {
-        return Err(InputError::NoDayFilesFound(args.input.clone()).into());
+        return Err(InputError::NoDayFilesFound(input.clone()).into());
     }
 
     Ok(day_files)

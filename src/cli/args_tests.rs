@@ -54,3 +54,28 @@ fn adjusted_mode_parses_both() {
     let args = Args::parse_from(["reload_rustdx", "--input", "./input", "--adjusted", "both"]);
     assert_eq!(args.adjusted, AdjustedMode::Both);
 }
+
+#[test]
+fn remote_download_defaults_to_false() {
+    let args = Args::parse_from(["reload_rustdx", "--input", "./input"]);
+    assert!(!args.remote_download);
+}
+
+#[test]
+fn remote_download_flag_sets_true() {
+    let args = Args::parse_from(["reload_rustdx", "--remote-download"]);
+    assert!(args.remote_download);
+}
+
+#[test]
+fn remote_download_allows_missing_input() {
+    let args = Args::parse_from(["reload_rustdx", "--remote-download"]);
+    assert!(args.input.is_none());
+}
+
+#[test]
+fn local_input_still_parsed_normally() {
+    let args = Args::parse_from(["reload_rustdx", "--input", "./vipdoc"]);
+    assert_eq!(args.input, Some(std::path::PathBuf::from("./vipdoc")));
+    assert!(!args.remote_download);
+}
