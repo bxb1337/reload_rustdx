@@ -50,6 +50,22 @@ pub enum RuntimeError {
         path: PathBuf,
         source: std::io::Error,
     },
+    CreateTempDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CreateDownloadFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ExtractArchive {
+        path: PathBuf,
+        reason: String,
+    },
+    CleanupTempDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     CurrentDir(std::io::Error),
     ReceiveWorkerResult(String),
     WorkerThreadPanicked,
@@ -187,6 +203,28 @@ impl Display for RuntimeError {
             Self::ReadDayFile { path, source } => {
                 write!(f, "Failed to read .day file '{}': {source}", path.display())
             }
+            Self::CreateTempDir { path, source } => write!(
+                f,
+                "Failed to create temporary workspace at '{}': {source}",
+                path.display()
+            ),
+            Self::CreateDownloadFile { path, source } => write!(
+                f,
+                "Failed to create download file at '{}': {source}",
+                path.display()
+            ),
+            Self::ExtractArchive { path, reason } => {
+                write!(
+                    f,
+                    "Failed to extract archive '{}': {reason}",
+                    path.display()
+                )
+            }
+            Self::CleanupTempDir { path, source } => write!(
+                f,
+                "Failed to clean up temporary workspace '{}': {source}",
+                path.display()
+            ),
             Self::CurrentDir(source) => {
                 write!(f, "Failed to determine current working directory: {source}")
             }
@@ -241,6 +279,9 @@ impl Error for RuntimeError {
             Self::ReadDir { source, .. } => Some(source),
             Self::ReadDirEntry { source, .. } => Some(source),
             Self::ReadDayFile { source, .. } => Some(source),
+            Self::CreateTempDir { source, .. } => Some(source),
+            Self::CreateDownloadFile { source, .. } => Some(source),
+            Self::CleanupTempDir { source, .. } => Some(source),
             Self::CurrentDir(source) => Some(source),
             _ => None,
         }

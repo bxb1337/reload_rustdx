@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Instant;
+use zip::ZipArchive;
 
 struct ParseMessage {
     path: PathBuf,
@@ -230,6 +231,92 @@ fn validate_gbbq_path(args: &Args) -> AppResult<()> {
         return Err(InputError::GbbqFileNotFound(path.clone()).into());
     }
     Ok(())
+}
+
+#[allow(dead_code)]
+fn create_remote_workspace() -> AppResult<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let workspace = std::env::temp_dir().join(format!("reload_rustdx_{nanos}_remote"));
+    std::fs::create_dir_all(&workspace).map_err(|source| RuntimeError::CreateTempDir {
+        path: workspace.clone(),
+        source,
+    })?;
+    Ok(workspace)
+}
+
+#[allow(dead_code)]
+fn extract_remote_archive(zip_path: &Path, workspace: &Path) -> AppResult<()> {
+    let zip_file = std::fs::File::open(zip_path).map_err(|source| RuntimeError::ReadDayFile {
+        path: zip_path.to_path_buf(),
+        source,
+    })?;
+    let mut archive = ZipArchive::new(zip_file).map_err(|e| RuntimeError::ExtractArchive {
+        path: zip_path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| RuntimeError::ExtractArchive {
+                path: zip_path.to_path_buf(),
+                reason: format!("entry {i}: {e}"),
+            })?;
+
+        let out_path = match entry.enclosed_name() {
+            Some(path) => workspace.join(path),
+            None => {
+                return Err(RuntimeError::ExtractArchive {
+                    path: zip_path.to_path_buf(),
+                    reason: format!("unsafe entry path in archive at index {i}"),
+                }
+                .into());
+            }
+        };
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|source| RuntimeError::CreateTempDir {
+                path: out_path.clone(),
+                source,
+            })?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| RuntimeError::CreateTempDir {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            let mut out_file =
+                std::fs::File::create(&out_path).map_err(|source| RuntimeError::CreateDownloadFile {
+                    path: out_path.clone(),
+                    source,
+                })?;
+            std::io::copy(&mut entry, &mut out_file).map_err(|source| {
+                RuntimeError::ExtractArchive {
+                    path: out_path.clone(),
+                    reason: source.to_string(),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn resolve_vipdoc_root(workspace: &Path) -> AppResult<PathBuf> {
+    let vipdoc = workspace.join("vipdoc");
+    if vipdoc.is_dir() {
+        Ok(vipdoc)
+    } else {
+        Err(RuntimeError::ExtractArchive {
+            path: workspace.to_path_buf(),
+            reason: "extracted archive does not contain a 'vipdoc' directory".to_owned(),
+        }
+        .into())
+    }
 }
 
 fn validate_input_source(args: &Args) -> AppResult<()> {

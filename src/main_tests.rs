@@ -1,6 +1,7 @@
 use super::{
-    collect_filtered_day_files, decide_worker_count, process_day_files,
-    resolve_adjusted_output_path, validate_gbbq_path, validate_input_source, StockBatchCsvWriter,
+    collect_filtered_day_files, create_remote_workspace, decide_worker_count,
+    extract_remote_archive, process_day_files, resolve_adjusted_output_path, resolve_vipdoc_root,
+    validate_gbbq_path, validate_input_source, StockBatchCsvWriter,
 };
 use crate::cli::args::AdjustedMode;
 use crate::cli::Args;
@@ -382,6 +383,76 @@ fn remote_download_does_not_reach_collect_day_files_panic() {
     };
     assert!(validate_input_source(&args).is_ok());
     assert!(args.input.is_none());
+}
+
+#[test]
+fn create_remote_workspace_creates_a_directory() {
+    let workspace = create_remote_workspace().expect("create workspace");
+    let exists = workspace.is_dir();
+    let _ = std::fs::remove_dir_all(&workspace);
+    assert!(exists);
+}
+
+#[test]
+fn extract_remote_archive_unpacks_nested_day_files() {
+    use std::io::Write;
+
+    let workspace = create_remote_workspace().expect("create workspace");
+    let zip_path = workspace.join("test.zip");
+
+    {
+        let zip_file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut writer = zip::ZipWriter::new(zip_file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("vipdoc/sh/sh600000.day", options)
+            .expect("start sh");
+        writer.write_all(&[0u8; 32]).expect("write sh bytes");
+        writer
+            .start_file("vipdoc/sz/sz000001.day", options)
+            .expect("start sz");
+        writer.write_all(&[0u8; 32]).expect("write sz bytes");
+        writer.finish().expect("finish zip");
+    }
+
+    extract_remote_archive(&zip_path, &workspace).expect("extract");
+
+    let sh_exists = workspace.join("vipdoc/sh/sh600000.day").exists();
+    let sz_exists = workspace.join("vipdoc/sz/sz000001.day").exists();
+    let _ = std::fs::remove_dir_all(&workspace);
+    assert!(sh_exists);
+    assert!(sz_exists);
+}
+
+#[test]
+fn extract_remote_archive_errors_on_unsafe_entry_path() {
+    use std::io::Write;
+
+    let workspace = create_remote_workspace().expect("create workspace");
+    let zip_path = workspace.join("evil.zip");
+
+    {
+        let zip_file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut writer = zip::ZipWriter::new(zip_file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("../escape.txt", options)
+            .expect("start evil entry");
+        writer.write_all(b"evil").expect("write evil bytes");
+        writer.finish().expect("finish zip");
+    }
+
+    let result = extract_remote_archive(&zip_path, &workspace);
+    let _ = std::fs::remove_dir_all(&workspace);
+    assert!(result.is_err());
+}
+
+#[test]
+fn resolve_vipdoc_root_returns_error_when_missing() {
+    let workspace = create_remote_workspace().expect("create workspace");
+    let result = resolve_vipdoc_root(&workspace);
+    let _ = std::fs::remove_dir_all(&workspace);
+    assert!(result.is_err());
 }
 
 #[test]
