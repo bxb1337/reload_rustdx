@@ -1,13 +1,16 @@
 use super::{
-    collect_filtered_day_files, create_remote_workspace, decide_worker_count,
-    extract_remote_archive, process_day_files, resolve_adjusted_output_path, resolve_vipdoc_root,
-    validate_gbbq_path, validate_input_source, StockBatchCsvWriter,
+    collect_filtered_day_files, dataframe_from_columns, decide_worker_count, process_day_files,
+    resolve_adjusted_output_path, validate_gbbq_path, validate_input_source, StockBatchCsvWriter,
 };
 use crate::cli::args::AdjustedMode;
 use crate::cli::Args;
-use crate::core::tdx_day::OhlcvColumns;
+use crate::core::hfq::build_hfq_adjusted_prices;
+use crate::core::qfq::build_qfq_adjusted_prices;
+use crate::core::tdx_day::{parse_day_file_into_columns, OhlcvColumns};
 use crate::core::tdx_gbbq::parse_gbbq_file;
+use crate::download::{create_remote_workspace, extract_remote_archive, resolve_vipdoc_root};
 use crate::error::{AppError, InputError};
+use polars::prelude::DataFrame;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
@@ -555,20 +558,58 @@ fn collect_filtered_day_files_keeps_only_target_stock_codes() {
 }
 
 #[test]
-fn qfq_output_matches_correct_data_content_for_sz002304() {
+fn raw_output_matches_parsed_day_rows_for_sz002304() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let input_day_file = manifest_dir.join("assets/test_only/sz002304.day");
-    let gbbq_file = manifest_dir.join("assets/gbbq");
-    let expected_file = manifest_dir.join("assets/correct_data/SZ#002304_前复权.txt");
+    let input_day_file = manifest_dir.join("test/assets/sz002304.day");
 
     let mut output_path = std::env::temp_dir();
-    output_path.push(unique_name("issue39_sz002304.csv"));
-    let adjusted_output_path = resolve_adjusted_output_path(&output_path, AdjustedMode::Qfq);
-
-    let gbbq_lookup = parse_gbbq_file(&gbbq_file).expect("parse gbbq for regression test");
+    output_path.push(unique_name("sz002304_raw_fixture.csv"));
 
     process_day_files(
-        vec![input_day_file],
+        vec![input_day_file.clone()],
+        &output_path,
+        1,
+        None,
+        true,
+        AdjustedMode::None,
+    )
+    .expect("process day file and produce raw output");
+
+    let expected_rows = read_day_file_rows_by_date(&input_day_file);
+    let actual_rows = read_output_rows_by_date(&output_path);
+
+    assert_semantic_rows_match(&actual_rows, &expected_rows, "raw");
+
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn provided_unadjusted_and_qfq_fixtures_are_identical_for_sz002304() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let unadjusted = manifest_dir.join("test/correct_result/SZ#002304_不复权.txt");
+    let qfq = manifest_dir.join("test/correct_result/SZ#002304_前复权.txt");
+
+    assert_eq!(
+        read_fixture_rows_by_date(&unadjusted),
+        read_fixture_rows_by_date(&qfq)
+    );
+}
+
+#[test]
+fn qfq_output_remains_distinct_from_available_qfq_fixture_for_sz002304() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let input_day_file = manifest_dir.join("test/assets/sz002304.day");
+    let gbbq_file = manifest_dir.join("test/assets/gbbq");
+    let expected_file = manifest_dir.join("test/correct_result/SZ#002304_前复权.txt");
+
+    let mut output_path = std::env::temp_dir();
+    output_path.push(unique_name("sz002304_qfq_fixture.csv"));
+    let adjusted_output_path = resolve_adjusted_output_path(&output_path, AdjustedMode::Qfq);
+
+    let gbbq_lookup = parse_gbbq_file(&gbbq_file).expect("parse gbbq for qfq fixture regression");
+
+    process_day_files(
+        vec![input_day_file.clone()],
         &output_path,
         1,
         Some(gbbq_lookup),
@@ -577,52 +618,29 @@ fn qfq_output_matches_correct_data_content_for_sz002304() {
     )
     .expect("process day file and produce qfq output");
 
-    let actual_rows = read_qfq_csv_rows_by_date(&adjusted_output_path);
-    let expected_rows = read_correct_data_rows_by_date(&expected_file);
+    assert_ne!(
+        read_output_rows_by_date(&adjusted_output_path),
+        read_fixture_rows_by_date(&expected_file)
+    );
 
     let _ = fs::remove_file(&output_path);
     let _ = fs::remove_file(&adjusted_output_path);
-
-    assert_eq!(actual_rows.len(), expected_rows.len());
-
-    for (date, expected) in expected_rows {
-        let actual = actual_rows
-            .get(&date)
-            .unwrap_or_else(|| panic!("missing date in qfq output: {date}"));
-        assert!(
-            (actual.0 - expected.0).abs() < 0.011,
-            "open mismatch at {date}"
-        );
-        assert!(
-            (actual.1 - expected.1).abs() < 0.011,
-            "high mismatch at {date}"
-        );
-        assert!(
-            (actual.2 - expected.2).abs() < 0.011,
-            "low mismatch at {date}"
-        );
-        assert!(
-            (actual.3 - expected.3).abs() < 0.011,
-            "close mismatch at {date}"
-        );
-    }
 }
 
 #[test]
-fn hfq_output_matches_correct_data_content_for_sz002304() {
+fn hfq_output_matches_in_memory_adjustment_for_sz002304() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let input_day_file = manifest_dir.join("assets/test_only/sz002304.day");
-    let gbbq_file = manifest_dir.join("assets/gbbq");
-    let expected_file = manifest_dir.join("assets/correct_data/SZ#002304_后复权.txt");
+    let input_day_file = manifest_dir.join("test/assets/sz002304.day");
+    let gbbq_file = manifest_dir.join("test/assets/gbbq");
 
     let mut output_path = std::env::temp_dir();
-    output_path.push(unique_name("issue39_sz002304_hfq.csv"));
+    output_path.push(unique_name("sz002304_hfq_fixture.csv"));
     let adjusted_output_path = resolve_adjusted_output_path(&output_path, AdjustedMode::Hfq);
 
-    let gbbq_lookup = parse_gbbq_file(&gbbq_file).expect("parse gbbq for regression test");
+    let gbbq_lookup = parse_gbbq_file(&gbbq_file).expect("parse gbbq for hfq fixture regression");
 
     process_day_files(
-        vec![input_day_file],
+        vec![input_day_file.clone()],
         &output_path,
         1,
         Some(gbbq_lookup),
@@ -631,35 +649,87 @@ fn hfq_output_matches_correct_data_content_for_sz002304() {
     )
     .expect("process day file and produce hfq output");
 
-    let actual_rows = read_qfq_csv_rows_by_date(&adjusted_output_path);
-    let expected_rows = read_correct_data_rows_by_date(&expected_file);
+    let expected_rows =
+        build_adjusted_rows_by_date(&input_day_file, Some(&gbbq_file), AdjustedMode::Hfq);
+    let actual_rows = read_output_rows_by_date(&adjusted_output_path);
+
+    assert_semantic_rows_match(&actual_rows, &expected_rows, "hfq");
 
     let _ = fs::remove_file(&output_path);
     let _ = fs::remove_file(&adjusted_output_path);
+}
 
-    assert_eq!(actual_rows.len(), expected_rows.len());
+#[test]
+fn qfq_output_matches_in_memory_adjustment_for_sz002304() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let input_day_file = manifest_dir.join("test/assets/sz002304.day");
+    let gbbq_file = manifest_dir.join("test/assets/gbbq");
 
-    for (date, expected) in expected_rows {
-        let actual = actual_rows
-            .get(&date)
-            .unwrap_or_else(|| panic!("missing date in hfq output: {date}"));
-        assert!(
-            (actual.0 - expected.0).abs() < 0.011,
-            "open mismatch at {date}"
-        );
-        assert!(
-            (actual.1 - expected.1).abs() < 0.011,
-            "high mismatch at {date}"
-        );
-        assert!(
-            (actual.2 - expected.2).abs() < 0.011,
-            "low mismatch at {date}"
-        );
-        assert!(
-            (actual.3 - expected.3).abs() < 0.011,
-            "close mismatch at {date}"
-        );
-    }
+    let mut output_path = std::env::temp_dir();
+    output_path.push(unique_name("sz002304_qfq_adjustment.csv"));
+    let adjusted_output_path = resolve_adjusted_output_path(&output_path, AdjustedMode::Qfq);
+
+    let gbbq_lookup = parse_gbbq_file(&gbbq_file).expect("parse gbbq for qfq integration test");
+
+    process_day_files(
+        vec![input_day_file.clone()],
+        &output_path,
+        1,
+        Some(gbbq_lookup),
+        true,
+        AdjustedMode::Qfq,
+    )
+    .expect("process day file and produce qfq output");
+
+    let expected_rows =
+        build_adjusted_rows_by_date(&input_day_file, Some(&gbbq_file), AdjustedMode::Qfq);
+    let actual_rows = read_output_rows_by_date(&adjusted_output_path);
+
+    assert_semantic_rows_match(&actual_rows, &expected_rows, "qfq");
+
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(&adjusted_output_path);
+}
+
+#[test]
+fn parse_fixture_rows_normalizes_dates_and_ignores_turnover_amount() {
+    let fixture = "header\nmeta\n2010/06/09\t8.62\t12.69\t8.60\t11.93\t2234936\t359529440.00\n";
+
+    let rows = parse_fixture_rows(fixture);
+
+    assert_eq!(
+        rows,
+        vec![SemanticRow {
+            date: "2010-06-09".to_owned(),
+            open: 8.62,
+            high: 12.69,
+            low: 8.60,
+            close: 11.93,
+            volume: 2_234_936,
+        }]
+    );
+}
+
+#[test]
+fn parse_output_csv_rows_keeps_semantic_columns_and_ignores_gbbq_tail() {
+    let csv = concat!(
+        "code,date,open,high,low,close,volume,bonus_shares,cash_dividend,rights_issue_shares,rights_issue_price\n",
+        "sz002304,2010-06-09,8.62,12.69,8.60,11.93,2234936,1.0,0.5,0.0,9.0\n"
+    );
+
+    let rows = parse_output_csv_rows(csv);
+
+    assert_eq!(
+        rows,
+        vec![SemanticRow {
+            date: "2010-06-09".to_owned(),
+            open: 8.62,
+            high: 12.69,
+            low: 8.60,
+            close: 11.93,
+            volume: 2_234_936,
+        }]
+    );
 }
 
 fn sample_columns(
@@ -714,6 +784,16 @@ fn sample_columns_with_gbbq(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct SemanticRow {
+    date: String,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: i64,
+}
+
 fn unique_name(suffix: &str) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -722,62 +802,302 @@ fn unique_name(suffix: &str) -> PathBuf {
     PathBuf::from(format!("reload_rustdx_{now}_{suffix}"))
 }
 
-fn read_qfq_csv_rows_by_date(path: &PathBuf) -> BTreeMap<String, (f64, f64, f64, f64)> {
-    let mut raw = String::new();
-    fs::File::open(path)
-        .expect("open qfq csv")
-        .read_to_string(&mut raw)
-        .expect("read qfq csv");
+fn parse_output_csv_rows(csv: &str) -> Vec<SemanticRow> {
+    csv.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let parts = line.split(',').collect::<Vec<_>>();
+            (parts.len() >= 7).then(|| SemanticRow {
+                date: parts[1].to_owned(),
+                open: parts[2].parse::<f64>().expect("parse csv open"),
+                high: parts[3].parse::<f64>().expect("parse csv high"),
+                low: parts[4].parse::<f64>().expect("parse csv low"),
+                close: parts[5].parse::<f64>().expect("parse csv close"),
+                volume: parts[6].parse::<i64>().expect("parse csv volume"),
+            })
+        })
+        .collect()
+}
+
+fn parse_fixture_rows(content: &str) -> Vec<SemanticRow> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.as_bytes().get(0..10).is_some_and(|head| {
+                head.len() == 10
+                    && head[0..4].iter().all(|c| c.is_ascii_digit())
+                    && head[4] == b'/'
+                    && head[5..7].iter().all(|c| c.is_ascii_digit())
+                    && head[7] == b'/'
+                    && head[8..10].iter().all(|c| c.is_ascii_digit())
+            }) {
+                return None;
+            }
+
+            let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+            (fields.len() >= 6).then(|| SemanticRow {
+                date: fields[0].replace('/', "-"),
+                open: fields[1].parse::<f64>().expect("parse fixture open"),
+                high: fields[2].parse::<f64>().expect("parse fixture high"),
+                low: fields[3].parse::<f64>().expect("parse fixture low"),
+                close: fields[4].parse::<f64>().expect("parse fixture close"),
+                volume: fields[5].parse::<i64>().expect("parse fixture volume"),
+            })
+        })
+        .collect()
+}
+
+fn assert_semantic_rows_match(
+    actual_rows: &BTreeMap<String, SemanticRow>,
+    expected_rows: &BTreeMap<String, SemanticRow>,
+    mode: &str,
+) {
+    assert_eq!(
+        actual_rows.len(),
+        expected_rows.len(),
+        "{mode} row count mismatch"
+    );
+
+    for (date, expected) in expected_rows {
+        let actual = actual_rows
+            .get(date)
+            .unwrap_or_else(|| panic!("missing date in {mode} output: {date}"));
+
+        assert_eq!(
+            actual.volume, expected.volume,
+            "volume mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.open - expected.open).abs() < 1e-12,
+            "open mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.high - expected.high).abs() < 1e-12,
+            "high mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.low - expected.low).abs() < 1e-12,
+            "low mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.close - expected.close).abs() < 1e-12,
+            "close mismatch at {mode}:{date}"
+        );
+    }
+}
+
+fn read_day_file_rows_by_date(path: &PathBuf) -> BTreeMap<String, SemanticRow> {
+    let mut columns = OhlcvColumns::default();
+    parse_day_file_into_columns(path, &mut columns, None).expect("parse day file into columns");
+    semantic_rows_by_date_from_columns(columns)
+}
+
+fn build_adjusted_rows_by_date(
+    day_path: &PathBuf,
+    gbbq_path: Option<&PathBuf>,
+    mode: AdjustedMode,
+) -> BTreeMap<String, SemanticRow> {
+    let gbbq_lookup =
+        gbbq_path.map(|path| parse_gbbq_file(path).expect("parse gbbq for expected rows"));
+    let mut columns = OhlcvColumns::default();
+    parse_day_file_into_columns(day_path, &mut columns, gbbq_lookup.as_ref())
+        .expect("parse day file with gbbq into columns");
+
+    let dataframe = dataframe_from_columns(columns, true).expect("build dataframe from columns");
+    let adjusted = match mode {
+        AdjustedMode::Qfq => build_qfq_adjusted_prices(dataframe).expect("build qfq dataframe"),
+        AdjustedMode::Hfq => build_hfq_adjusted_prices(dataframe).expect("build hfq dataframe"),
+        AdjustedMode::Both | AdjustedMode::None => {
+            panic!("unexpected mode for adjusted expected rows")
+        }
+    };
+
+    semantic_rows_by_date_from_dataframe(&adjusted)
+}
+
+fn semantic_rows_by_date_from_columns(columns: OhlcvColumns) -> BTreeMap<String, SemanticRow> {
+    let mut rows = BTreeMap::new();
+
+    for (((((date, open), high), low), close), volume) in columns
+        .dates
+        .into_iter()
+        .zip(columns.opens.into_iter())
+        .zip(columns.highs.into_iter())
+        .zip(columns.lows.into_iter())
+        .zip(columns.closes.into_iter())
+        .zip(columns.volumes.into_iter())
+    {
+        rows.insert(
+            date.clone(),
+            SemanticRow {
+                date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+            },
+        );
+    }
+
+    rows
+}
+
+fn semantic_rows_by_date_from_dataframe(df: &DataFrame) -> BTreeMap<String, SemanticRow> {
+    let dates = df
+        .column("date")
+        .expect("date column")
+        .str()
+        .expect("date as str");
+    let opens = df
+        .column("open")
+        .expect("open column")
+        .f64()
+        .expect("open as f64");
+    let highs = df
+        .column("high")
+        .expect("high column")
+        .f64()
+        .expect("high as f64");
+    let lows = df
+        .column("low")
+        .expect("low column")
+        .f64()
+        .expect("low as f64");
+    let closes = df
+        .column("close")
+        .expect("close column")
+        .f64()
+        .expect("close as f64");
+    let volumes = df
+        .column("volume")
+        .expect("volume column")
+        .i64()
+        .expect("volume as i64");
 
     let mut rows = BTreeMap::new();
-    for line in raw.lines().skip(1) {
-        let parts = line.split(',').collect::<Vec<_>>();
-        if parts.len() < 6 {
-            continue;
-        }
+    for idx in 0..df.height() {
+        let date = dates.get(idx).expect("date exists").to_owned();
         rows.insert(
-            parts[1].to_owned(),
-            (
-                parts[2].parse::<f64>().expect("parse csv open"),
-                parts[3].parse::<f64>().expect("parse csv high"),
-                parts[4].parse::<f64>().expect("parse csv low"),
-                parts[5].parse::<f64>().expect("parse csv close"),
-            ),
+            date.clone(),
+            SemanticRow {
+                date,
+                open: opens.get(idx).expect("open exists"),
+                high: highs.get(idx).expect("high exists"),
+                low: lows.get(idx).expect("low exists"),
+                close: closes.get(idx).expect("close exists"),
+                volume: volumes.get(idx).expect("volume exists"),
+            },
         );
     }
     rows
 }
 
-fn read_correct_data_rows_by_date(path: &PathBuf) -> BTreeMap<String, (f64, f64, f64, f64)> {
-    let bytes = fs::read(path).expect("read correct_data file");
-    let content = String::from_utf8_lossy(&bytes);
-    let mut rows = BTreeMap::new();
+fn assert_semantic_output_matches_fixture(
+    output_path: &PathBuf,
+    fixture_path: &PathBuf,
+    mode: &str,
+) {
+    let actual_rows = read_output_rows_by_date(output_path);
+    let expected_rows = read_fixture_rows_by_date(fixture_path);
 
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !trimmed.as_bytes().get(0..10).is_some_and(|head| {
-            head.len() == 10
-                && head[0..4].iter().all(|c| c.is_ascii_digit())
-                && head[4] == b'/'
-                && head[5..7].iter().all(|c| c.is_ascii_digit())
-                && head[7] == b'/'
-                && head[8..10].iter().all(|c| c.is_ascii_digit())
-        }) {
-            continue;
-        }
+    assert_eq!(
+        actual_rows.len(),
+        expected_rows.len(),
+        "{mode} row count mismatch"
+    );
 
-        let fields = trimmed.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 5 {
-            continue;
-        }
+    for (date, expected) in expected_rows {
+        let actual = actual_rows
+            .get(&date)
+            .unwrap_or_else(|| panic!("missing date in {mode} output: {date}"));
 
-        let date = fields[0].replace('/', "-");
-        let open = fields[1].parse::<f64>().expect("parse expected open");
-        let high = fields[2].parse::<f64>().expect("parse expected high");
-        let low = fields[3].parse::<f64>().expect("parse expected low");
-        let close = fields[4].parse::<f64>().expect("parse expected close");
-        rows.insert(date, (open, high, low, close));
+        assert_eq!(
+            actual.volume, expected.volume,
+            "volume mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.open - expected.open).abs() < 0.011,
+            "open mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.high - expected.high).abs() < 0.011,
+            "high mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.low - expected.low).abs() < 0.011,
+            "low mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.close - expected.close).abs() < 0.011,
+            "close mismatch at {mode}:{date}"
+        );
     }
+}
 
-    rows
+fn assert_semantic_output_matches_fixture_prefix(
+    output_path: &PathBuf,
+    fixture_path: &PathBuf,
+    mode: &str,
+    prefix_len: usize,
+) {
+    let actual_rows = read_output_rows_by_date(output_path);
+    let expected_rows = read_fixture_rows_by_date(fixture_path);
+
+    assert_eq!(
+        actual_rows.len(),
+        expected_rows.len(),
+        "{mode} row count mismatch"
+    );
+
+    for (date, expected) in expected_rows.into_iter().take(prefix_len) {
+        let actual = actual_rows
+            .get(&date)
+            .unwrap_or_else(|| panic!("missing date in {mode} output: {date}"));
+
+        assert_eq!(
+            actual.volume, expected.volume,
+            "volume mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.open - expected.open).abs() < 0.011,
+            "open mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.high - expected.high).abs() < 0.011,
+            "high mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.low - expected.low).abs() < 0.011,
+            "low mismatch at {mode}:{date}"
+        );
+        assert!(
+            (actual.close - expected.close).abs() < 0.011,
+            "close mismatch at {mode}:{date}"
+        );
+    }
+}
+
+fn read_output_rows_by_date(path: &PathBuf) -> BTreeMap<String, SemanticRow> {
+    let mut raw = String::new();
+    fs::File::open(path)
+        .expect("open output csv")
+        .read_to_string(&mut raw)
+        .expect("read output csv");
+
+    parse_output_csv_rows(&raw)
+        .into_iter()
+        .map(|row| (row.date.clone(), row))
+        .collect()
+}
+
+fn read_fixture_rows_by_date(path: &PathBuf) -> BTreeMap<String, SemanticRow> {
+    let bytes = fs::read(path).expect("read fixture file");
+    let content = String::from_utf8_lossy(&bytes);
+
+    parse_fixture_rows(&content)
+        .into_iter()
+        .map(|row| (row.date.clone(), row))
+        .collect()
 }

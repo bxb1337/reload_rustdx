@@ -2,6 +2,7 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 mod cli;
 mod core;
+mod download;
 mod error;
 
 use cli::Args;
@@ -12,18 +13,15 @@ use core::tdx_day::{
     OhlcvColumns, collect_day_files, is_target_stock_code, parse_day_file_into_columns,
 };
 use core::tdx_gbbq::{GbbqLookup, parse_gbbq_file};
+use download::prepare_remote_workspace;
 use error::{AppError, AppResult, InputError, OutputError, ParseError, RuntimeError};
 use polars::prelude::{CsvWriter, DataFrame, NamedFrom, SerWriter, Series};
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Instant;
-use zip::ZipArchive;
-
-const REMOTE_DAY_ZIP_URL: &str = "https://data.tdx.com.cn/vipdoc/hsjday.zip";
 
 struct ParseMessage {
     path: PathBuf,
@@ -184,13 +182,7 @@ fn main() -> AppResult<()> {
     validate_gbbq_path(&args)?;
 
     let remote_workspace: Option<PathBuf> = if args.remote_download {
-        let workspace = create_remote_workspace()?;
-        let zip_path = workspace.join("hsjday.zip");
-        download_remote_archive(REMOTE_DAY_ZIP_URL, &zip_path)?;
-        println!("Extracting archive...");
-        extract_remote_archive(&zip_path, &workspace)?;
-        let _ = std::fs::remove_file(&zip_path);
-        Some(workspace)
+        Some(prepare_remote_workspace()?)
     } else {
         None
     };
@@ -256,158 +248,6 @@ fn validate_gbbq_path(args: &Args) -> AppResult<()> {
         return Err(InputError::GbbqFileNotFound(path.clone()).into());
     }
     Ok(())
-}
-
-fn create_remote_workspace() -> AppResult<PathBuf> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let workspace = std::env::temp_dir().join(format!("reload_rustdx_{nanos}_remote"));
-    std::fs::create_dir_all(&workspace).map_err(|source| RuntimeError::CreateTempDir {
-        path: workspace.clone(),
-        source,
-    })?;
-    Ok(workspace)
-}
-
-fn extract_remote_archive(zip_path: &Path, workspace: &Path) -> AppResult<()> {
-    let zip_file = std::fs::File::open(zip_path).map_err(|source| RuntimeError::ReadDayFile {
-        path: zip_path.to_path_buf(),
-        source,
-    })?;
-    let mut archive = ZipArchive::new(zip_file).map_err(|e| RuntimeError::ExtractArchive {
-        path: zip_path.to_path_buf(),
-        reason: e.to_string(),
-    })?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| RuntimeError::ExtractArchive {
-                path: zip_path.to_path_buf(),
-                reason: format!("entry {i}: {e}"),
-            })?;
-
-        let out_path = match entry.enclosed_name() {
-            Some(path) => workspace.join(path),
-            None => {
-                return Err(RuntimeError::ExtractArchive {
-                    path: zip_path.to_path_buf(),
-                    reason: format!("unsafe entry path in archive at index {i}"),
-                }
-                .into());
-            }
-        };
-
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out_path).map_err(|source| RuntimeError::CreateTempDir {
-                path: out_path.clone(),
-                source,
-            })?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|source| RuntimeError::CreateTempDir {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            let mut out_file =
-                std::fs::File::create(&out_path).map_err(|source| RuntimeError::CreateDownloadFile {
-                    path: out_path.clone(),
-                    source,
-                })?;
-            std::io::copy(&mut entry, &mut out_file).map_err(|source| {
-                RuntimeError::ExtractArchive {
-                    path: out_path.clone(),
-                    reason: source.to_string(),
-                }
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn download_remote_archive(url: &str, dest: &Path) -> AppResult<()> {
-    println!("Downloading {url} ...");
-
-    let response = reqwest::blocking::Client::builder()
-        .build()
-        .and_then(|client| client.get(url).send())
-        .map_err(|e| RuntimeError::DownloadFailed {
-            url: url.to_owned(),
-            reason: e.to_string(),
-        })?;
-
-    if !response.status().is_success() {
-        return Err(RuntimeError::DownloadFailed {
-            url: url.to_owned(),
-            reason: format!("HTTP {}", response.status()),
-        }
-        .into());
-    }
-
-    let total_size = response.content_length();
-    let progress = if let Some(size) = total_size {
-        let pb = ProgressBar::new(size);
-        if let Ok(style) = ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40.green/white} {bytes}/{total_bytes} ({bytes_per_sec})",
-        ) {
-            pb.set_style(style.progress_chars("=>-"));
-        }
-        pb
-    } else {
-        let pb = ProgressBar::new_spinner();
-        if let Ok(style) =
-            ProgressStyle::with_template("[{elapsed_precise}] {bytes} ({bytes_per_sec})")
-        {
-            pb.set_style(style);
-        }
-        pb
-    };
-
-    let mut out_file =
-        File::create(dest).map_err(|source| RuntimeError::CreateDownloadFile {
-            path: dest.to_path_buf(),
-            source,
-        })?;
-
-    let mut reader = response;
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = std::io::Read::read(&mut reader, &mut buf).map_err(|e| {
-            RuntimeError::DownloadFailed {
-                url: url.to_owned(),
-                reason: e.to_string(),
-            }
-        })?;
-        if n == 0 {
-            break;
-        }
-        out_file.write_all(&buf[..n]).map_err(|source| RuntimeError::CreateDownloadFile {
-            path: dest.to_path_buf(),
-            source: std::io::Error::new(source.kind(), source.to_string()),
-        })?;
-        progress.inc(n as u64);
-    }
-
-    progress.finish_and_clear();
-    println!("Download complete.");
-    Ok(())
-}
-
-#[cfg(test)]
-fn resolve_vipdoc_root(workspace: &Path) -> AppResult<PathBuf> {
-    let vipdoc = workspace.join("vipdoc");
-    if vipdoc.is_dir() {
-        Ok(vipdoc)
-    } else {
-        Err(RuntimeError::ExtractArchive {
-            path: workspace.to_path_buf(),
-            reason: "extracted archive does not contain a 'vipdoc' directory".to_owned(),
-        }
-        .into())
-    }
 }
 
 fn validate_input_source(args: &Args) -> AppResult<()> {
